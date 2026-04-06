@@ -1,0 +1,18 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data sensitif (dokumen PDF)
+pdf_mentah/
+data_lelang/
+output_md/
+temp_input/
+
+# Environment secrets
+secret_supabase.env
+*.env
+
+# MinerU temp
+*.log

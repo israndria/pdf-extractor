@@ -1,0 +1,26 @@
+# ============================================================
+# requirements.txt — V25 PDF Extractor (MinerU)
+# ============================================================
+# PREREQ:
+#   - Python 3.12 (BUKAN 3.13 — Ray tidak support Windows 3.13)
+#   - Venv dibuat dari: py -3.12 -m venv venv
+#
+# SETUP:
+#   venv\Scripts\pip install uv
+#   venv\Scripts\uv pip install -r requirements.txt
+#
+# Model MinerU (~3-4GB) akan auto-download saat pertama kali dijalankan.
+# Atau predownload: venv\Scripts\mineru-models-download -s huggingface -m pipeline
+# ============================================================
+
+# Core: MinerU PDF Extractor (deep learning, OCR untuk scan PDF)
+mineru[core]
+
+# Streamlit UI
+streamlit
+
+# Supabase client
+supabase
+
+# Pandas (untuk tabel di UI)
+pandas
