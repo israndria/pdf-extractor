@@ -25,6 +25,7 @@ from engine.parser_field import parse_field_pengadaan, export_ke_lpse_json, hitu
 from engine.supabase_uploader import simpan_ke_supabase, cek_koneksi_supabase
 from engine.md_ke_docx import md_ke_bytes
 from engine.content_list_ke_docx import content_list_ke_bytes
+from engine.md_tambah_indent import md_indent_ke_bytes
 
 # ─────────────────────────────────────────────
 # KONFIGURASI HALAMAN
@@ -216,16 +217,26 @@ with tab1:
                     st.metric("Panjang teks", f"{len(teks):,} karakter")
                     st.markdown("**Preview (500 karakter pertama):**")
                     st.code(teks[:500], language=None)
-                    col_dl1, col_dl2 = st.columns(2)
+                    col_dl1, col_dl2, col_dl3 = st.columns(3)
                     with col_dl1:
                         st.download_button(
-                            label="⬇️ Download Markdown",
+                            label="⬇️ MD Mentah",
                             data=teks.encode("utf-8"),
                             file_name=f"{Path(nama_file).stem}.md",
                             mime="text/markdown",
                             key=f"dl_md_{nama_file}",
+                            help="Markdown asli MinerU — untuk arsip atau proses lanjutan",
                         )
                     with col_dl2:
+                        st.download_button(
+                            label="⬇️ MD + Indent (untuk AI)",
+                            data=md_indent_ke_bytes(teks),
+                            file_name=f"{Path(nama_file).stem}_indent.md",
+                            mime="text/markdown",
+                            key=f"dl_md_indent_{nama_file}",
+                            help="Markdown dengan indentasi a./1)/(a)/(1) — upload ke ChatBot untuk fix typo, lalu konversi ke DOCX",
+                        )
+                    with col_dl3:
                         try:
                             # Gunakan content_list.json jika tersedia (lebih akurat)
                             cl_path = hasil.get("content_list_path")
