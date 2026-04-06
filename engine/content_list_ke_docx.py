@@ -96,42 +96,76 @@ def _baca_margin_dari_middle(middle_json_path: Path) -> dict:
 
 
 # ─────────────────────────────────────────────
-# KALIBRASI INDENTASI — Percentile Binning
+# DETEKSI LEVEL INDENT — Hybrid (Prefix + X0)
 # ─────────────────────────────────────────────
 
-def _bangun_x0_mapper(blocks, n_levels: int = 6, batas_kanan: float = 350):
-    """
-    Buat fungsi mapper: x0_float → indent_level (int 0..n_levels-1)
+# Pola penomoran dokumen legal Indonesia (dari terdalam ke terluar)
+_POLA_LEVEL = [
+    (re.compile(r"^\(\d{1,2}\)\s"), 4),   # (1) (2) — terdalam
+    (re.compile(r"^\([a-z]\)\s"),   3),   # (a) (b)
+    (re.compile(r"^\d{1,2}\)\s"),   2),   # 1) 2) (angka + tutup kurung)
+    (re.compile(r"^[a-z]\.\s"),     1),   # a. b. (huruf kecil + titik)
+]
 
-    Menggunakan percentile 5%-95% agar outlier scan tidak menggeser mapping.
-    n_levels=6 lebih granular — bisa membedakan a., 1), (a), (1) secara tepat.
+
+def _hitung_x0_base(blocks, batas_kanan: float = 350) -> float:
     """
-    x0_vals = []
+    Hitung x0 baseline (margin kiri dokumen) dari blok body text.
+    Ambil percentile 20% dari x0 yang tidak cocok pola penomoran,
+    agar tidak terpengaruh outlier OCR atau teks indented.
+    """
+    FALLBACK = 150.0
+    x0_body = []
     for b in blocks:
-        if b.get("type") == "text" and b.get("bbox"):
-            x0 = b["bbox"][0]
-            if x0 < batas_kanan:
-                x0_vals.append(x0)
+        if b.get("type") != "text" or not b.get("bbox"):
+            continue
+        x0 = b["bbox"][0]
+        if x0 >= batas_kanan:
+            continue
+        teks = b.get("text", "").strip()
+        # Hanya ambil teks yang TIDAK punya prefix penomoran (body text murni)
+        if not any(p.match(teks) for p, _ in _POLA_LEVEL):
+            x0_body.append(x0)
 
-    if not x0_vals:
-        return lambda x: 0, 0, 0
+    if not x0_body:
+        return FALLBACK
 
-    x0_sorted = sorted(x0_vals)
+    x0_sorted = sorted(x0_body)
     n = len(x0_sorted)
-    x0_min = x0_sorted[max(0, int(n * 0.05))]
-    x0_max = x0_sorted[min(n - 1, int(n * 0.95))]
-    span = x0_max - x0_min
+    # Ambil percentile 20% → mendekati margin kiri asli dokumen
+    return x0_sorted[max(0, int(n * 0.20))]
 
-    if span < 10:
-        return lambda x: 0, x0_min, x0_max
 
-    slot_size = span / n_levels
+def _deteksi_level_hybrid(teks: str, x0: float, x0_base: float) -> int:
+    """
+    Deteksi level indent: prefix teks (primary) atau x0 offset (fallback).
 
-    def mapper(x0: float) -> int:
-        lvl = int((x0 - x0_min) / slot_size)
-        return max(0, min(n_levels - 1, lvl))
+    1. Jika teks cocok pola penomoran (a., 1), (a), (1)) → gunakan level pola
+    2. Jika tidak → hitung offset dari x0_base, petakan ke level 0-4
 
-    return mapper, x0_min, x0_max
+    Offset thresholds (calibrated dari SP Dhayfullah):
+      <20  → level 0 (body)
+      20-45 → level 1 (setara a.)
+      45-65 → level 2 (setara 1))
+      65-90 → level 3 (setara (a))
+      ≥90   → level 4 (setara (1))
+    """
+    stripped = teks.strip()
+    for pola, level in _POLA_LEVEL:
+        if pola.match(stripped):
+            return level
+
+    # Fallback: x0 offset dari baseline margin kiri
+    offset = x0 - x0_base
+    if offset < 20:
+        return 0
+    if offset < 45:
+        return 1
+    if offset < 65:
+        return 2
+    if offset < 90:
+        return 3
+    return 4
 
 
 # ─────────────────────────────────────────────
@@ -212,24 +246,23 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
         for run in p.runs:
             _set_run_font(run)
 
-    # ── Bangun mapper x0 → indent level ─────
-    mapper, x0_min, x0_max = _bangun_x0_mapper(blocks, n_levels=6, batas_kanan=350)
+    # ── Hitung x0 baseline untuk deteksi indent ──
+    x0_base = _hitung_x0_base(blocks)
     CM_PER_LEVEL = 0.6   # indent Word per level (lebih rapat = lebih mirip PDF)
 
     halaman_sebelumnya = None
-    pertama_di_halaman = True   # untuk suppress spasi ganda setelah page break
+    needs_page_break = False   # flag: halaman baru, pasang page_break_before pada paragraf berikutnya
+    pertama_di_halaman = True  # flag: suppress space_before pada elemen pertama halaman baru
 
     for block in blocks:
         tipe = block.get("type", "")
         page_idx = block.get("page_idx")
 
-        # ── Page break antar halaman ─────────
-        pindah_halaman = False
+        # ── Deteksi pindah halaman ───────────
         if page_idx is not None and halaman_sebelumnya is not None:
             try:
                 if int(page_idx) != int(halaman_sebelumnya):
-                    doc.add_page_break()
-                    pindah_halaman = True
+                    needs_page_break = True
                     pertama_di_halaman = True
             except (ValueError, TypeError):
                 pass
@@ -248,40 +281,48 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
 
             text_level = block.get("text_level")
             bbox = block.get("bbox", [])
-            x0 = bbox[0] if bbox else x0_min
-            lvl = mapper(x0)
+            x0 = bbox[0] if bbox else x0_base
+            lvl = _deteksi_level_hybrid(teks, x0, x0_base)
 
             # Space before: 0 jika blok pertama di halaman baru
             sp_before = Pt(0) if pertama_di_halaman else Pt(2)
             pertama_di_halaman = False
 
+            # Heading level 1 — teks_level=1 ATAU text_level=2 dengan x0 di margin kiri (lvl<=1)
             if text_level == 1:
                 p = doc.add_heading(teks, level=1)
+                if needs_page_break:
+                    p.paragraph_format.page_break_before = True
+                    needs_page_break = False
                 p.paragraph_format.space_before = sp_before
                 p.paragraph_format.space_after = Pt(2)
+                p.paragraph_format.keep_with_next = True   # jangan biarkan heading sendirian di bawah halaman
                 for run in p.runs:
                     _set_run_font(run)
                     run.font.bold = True
                 continue
 
-            if text_level == 2:
-                if lvl <= 1:
-                    p = doc.add_heading(teks, level=2)
-                    p.paragraph_format.space_before = sp_before
-                    p.paragraph_format.space_after = Pt(2)
-                    for run in p.runs:
-                        _set_run_font(run)
-                        run.font.bold = True
-                else:
-                    p = doc.add_paragraph()
-                    p.paragraph_format.left_indent = Cm(CM_PER_LEVEL * lvl)
-                    p.paragraph_format.space_before = sp_before
-                    p.paragraph_format.space_after = Pt(2)
-                    _tambah_runs(p, teks)
+            # Heading level 2 — jika text_level=2 DAN tidak punya prefix penomoran
+            # (a. b. 1) dll → bukan heading, tapi paragraf indented)
+            teks_punya_prefix = any(p.match(teks.strip()) for p, _ in _POLA_LEVEL)
+            if text_level == 2 and not teks_punya_prefix:
+                p = doc.add_heading(teks, level=2)
+                if needs_page_break:
+                    p.paragraph_format.page_break_before = True
+                    needs_page_break = False
+                p.paragraph_format.space_before = sp_before
+                p.paragraph_format.space_after = Pt(2)
+                p.paragraph_format.keep_with_next = True   # heading selalu menempel ke konten berikutnya
+                for run in p.runs:
+                    _set_run_font(run)
+                    run.font.bold = True
                 continue
 
-            # Paragraf biasa
+            # Paragraf biasa / indented (termasuk text_level=2 dengan lvl>0)
             p = doc.add_paragraph()
+            if needs_page_break:
+                p.paragraph_format.page_break_before = True
+                needs_page_break = False
             if lvl > 0:
                 p.paragraph_format.left_indent = Cm(CM_PER_LEVEL * lvl)
             p.paragraph_format.space_before = sp_before
@@ -290,38 +331,47 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
 
         # ─── Blok tabel ─────────────────────
         elif tipe == "table":
-            pertama_di_halaman = False
             table_body = block.get("table_body", "")
             caption = block.get("table_caption", "")
             if table_body:
+                # Jika perlu page break, sisipkan paragraf kosong sebagai pembawa
+                if needs_page_break:
+                    pb_para = doc.add_paragraph()
+                    pb_para.paragraph_format.page_break_before = True
+                    pb_para.paragraph_format.space_before = Pt(0)
+                    pb_para.paragraph_format.space_after = Pt(0)
+                    needs_page_break = False
                 try:
                     _tambah_tabel_html(doc, table_body)
                 except Exception:
                     teks_bersih = re.sub(r"<[^>]+>", " ", table_body)
                     teks_bersih = re.sub(r"\s+", " ", teks_bersih).strip()
                     if teks_bersih:
-                        p = doc.add_paragraph(teks_bersih)
+                        doc.add_paragraph(teks_bersih)
             if caption and str(caption) not in ("[]", "", "['']"):
                 caption_str = str(caption).strip("[]'\"").strip()
                 if caption_str:
                     doc.add_paragraph(caption_str)
-            doc.add_paragraph()
+            pertama_di_halaman = False
 
         # ─── Blok gambar / stempel ──────────
         elif tipe in ("image", "seal"):
-            pertama_di_halaman = False
             img_path_rel = block.get("img_path", "")
             if img_path_rel:
                 img_abs = json_path.parent / img_path_rel
                 if img_abs.exists():
                     try:
                         p = doc.add_paragraph()
+                        if needs_page_break:
+                            p.paragraph_format.page_break_before = True
+                            needs_page_break = False
                         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                         run = p.add_run()
                         lebar = Inches(2) if tipe == "seal" else Inches(4)
                         run.add_picture(str(img_abs), width=lebar)
                     except Exception:
                         pass
+            pertama_di_halaman = False
 
     return doc
 
