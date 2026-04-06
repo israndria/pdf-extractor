@@ -1,9 +1,11 @@
 """
-engine/content_list_ke_docx.py — Konverter MinerU content_list.json → DOCX (v3)
+engine/content_list_ke_docx.py — Konverter MinerU content_list.json → DOCX (v4)
 ================================================================================
-Menggunakan metadata struktural MinerU untuk DOCX akurat:
-  - Indentasi dari bbox.x0 via percentile-binning per dokumen
-  - Heading level dari text_level MinerU
+Menggunakan metadata struktural MinerU untuk DOCX semirip mungkin dengan PDF:
+  - Margin dihitung otomatis dari middle.json (bbox median per halaman)
+  - Font: Times New Roman 12pt (standar SP/dokumen pemerintah Indonesia)
+  - Indentasi: percentile binning 6 level dari bbox.x0 per dokumen
+  - Page break tepat per halaman tanpa spasi ganda
   - Tabel dengan colspan/rowspan penuh
   - Gambar/stempel embedded
 
@@ -15,34 +17,100 @@ import json
 import io
 import re
 import html as html_lib
+import statistics
 from pathlib import Path
+from typing import Optional, Callable
 
 from docx import Document
 from docx.shared import Pt, Cm, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+
+# ─────────────────────────────────────────────
+# KONSTANTA FONT
+# ─────────────────────────────────────────────
+
+FONT_BODY = "Times New Roman"
+FONT_SIZE_BODY = 12       # pt
+FONT_SIZE_HEADING1 = 13   # pt — sedikit lebih besar dari body
+FONT_SIZE_HEADING2 = 12   # pt — sama dengan body, tapi bold
+
+
+# ─────────────────────────────────────────────
+# BACA MARGIN DARI middle.json
+# ─────────────────────────────────────────────
+
+def _baca_margin_dari_middle(middle_json_path: Path) -> dict:
+    """
+    Hitung margin halaman dari bbox blok teks di middle.json.
+    Return dict: {left, right, top, bottom} dalam Cm.
+    Fallback ke margin standar jika middle.json tidak ada.
+    """
+    FALLBACK = {"left": Cm(3.0), "right": Cm(2.5), "top": Cm(2.5), "bottom": Cm(3.0)}
+    if not middle_json_path.exists():
+        return FALLBACK
+
+    try:
+        with open(middle_json_path, encoding="utf-8") as f:
+            mid = json.load(f)
+
+        pages = mid.get("pdf_info", [])
+        if not pages:
+            return FALLBACK
+
+        W, H = pages[0].get("page_size", [595, 842])
+        x0_list, x1_list, y0_list, y1_list = [], [], [], []
+
+        for pg in pages:
+            blks = [b for b in pg.get("para_blocks", [])
+                    if b.get("type") in ("text", "title") and b.get("bbox")]
+            if not blks:
+                continue
+            bboxes = [b["bbox"] for b in blks]
+            x0_list.append(min(b[0] for b in bboxes))
+            x1_list.append(max(b[2] for b in bboxes))
+            y0_list.append(min(b[1] for b in bboxes))
+            y1_list.append(max(b[3] for b in bboxes))
+
+        if not x0_list:
+            return FALLBACK
+
+        def pts_ke_cm(pts: float) -> object:
+            return Cm(max(1.5, pts / 72 * 2.54))
+
+        ml = statistics.median(x0_list)
+        mr = W - statistics.median(x1_list)
+        mt = statistics.median(y0_list)
+        mb = H - statistics.median(y1_list)
+
+        return {
+            "left":   pts_ke_cm(ml),
+            "right":  pts_ke_cm(mr),
+            "top":    pts_ke_cm(mt),
+            "bottom": pts_ke_cm(mb),
+        }
+    except Exception:
+        return FALLBACK
 
 
 # ─────────────────────────────────────────────
 # KALIBRASI INDENTASI — Percentile Binning
 # ─────────────────────────────────────────────
 
-def _bangun_x0_mapper(blocks, n_levels: int = 4, batas_kanan: float = 350):
+def _bangun_x0_mapper(blocks, n_levels: int = 6, batas_kanan: float = 350):
     """
     Buat fungsi mapper: x0_float → indent_level (int 0..n_levels-1)
 
-    Strategi:
-    1. Kumpulkan semua x0 dari blok teks body (bukan heading, bukan centered)
-    2. Hitung min dan max x0 → definisikan range
-    3. Bagi range menjadi n_levels slot sama besar
-    4. Return lambda yang memetakan x0 ke slot-nya
-
-    Hasilnya robust untuk scan PDF karena tidak bergantung pada gap antar x0.
+    Menggunakan percentile 5%-95% agar outlier scan tidak menggeser mapping.
+    n_levels=6 lebih granular — bisa membedakan a., 1), (a), (1) secara tepat.
     """
     x0_vals = []
     for b in blocks:
         if b.get("type") == "text" and b.get("bbox"):
             x0 = b["bbox"][0]
-            if x0 < batas_kanan:  # skip teks terpusat (judul halaman, stempel, dll.)
+            if x0 < batas_kanan:
                 x0_vals.append(x0)
 
     if not x0_vals:
@@ -50,13 +118,11 @@ def _bangun_x0_mapper(blocks, n_levels: int = 4, batas_kanan: float = 350):
 
     x0_sorted = sorted(x0_vals)
     n = len(x0_sorted)
-    # Gunakan percentile 5%-95% agar outlier tidak menggeser seluruh mapping
     x0_min = x0_sorted[max(0, int(n * 0.05))]
     x0_max = x0_sorted[min(n - 1, int(n * 0.95))]
     span = x0_max - x0_min
 
     if span < 10:
-        # Semua teks di posisi sama — tidak ada indentasi
         return lambda x: 0, x0_min, x0_max
 
     slot_size = span / n_levels
@@ -69,6 +135,49 @@ def _bangun_x0_mapper(blocks, n_levels: int = 4, batas_kanan: float = 350):
 
 
 # ─────────────────────────────────────────────
+# SET FONT DEFAULT DOKUMEN
+# ─────────────────────────────────────────────
+
+def _set_font_dokumen(doc: Document):
+    """Set font default dokumen ke Times New Roman 12pt."""
+    style = doc.styles["Normal"]
+    font = style.font
+    font.name = FONT_BODY
+    font.size = Pt(FONT_SIZE_BODY)
+
+    # Set juga di elemen XML untuk kompatibilitas penuh
+    rPr = style.element.get_or_add_rPr()
+    rFonts = OxmlElement("w:rFonts")
+    rFonts.set(qn("w:ascii"), FONT_BODY)
+    rFonts.set(qn("w:hAnsi"), FONT_BODY)
+    rFonts.set(qn("w:cs"), FONT_BODY)
+    rPr.insert(0, rFonts)
+
+    # Heading 1 — bold, 13pt
+    for h_name, h_size in [("Heading 1", FONT_SIZE_HEADING1), ("Heading 2", FONT_SIZE_HEADING2)]:
+        if h_name in doc.styles:
+            hstyle = doc.styles[h_name]
+            hstyle.font.name = FONT_BODY
+            hstyle.font.size = Pt(h_size)
+            hstyle.font.bold = True
+            hstyle.font.color.rgb = None  # hitam (reset dari biru default Word)
+
+
+def _set_run_font(run):
+    """Set font pada sebuah run ke Times New Roman."""
+    run.font.name = FONT_BODY
+    run.font.size = Pt(FONT_SIZE_BODY)
+    # XML-level untuk kompatibilitas
+    rPr = run._r.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.insert(0, rFonts)
+    rFonts.set(qn("w:ascii"), FONT_BODY)
+    rFonts.set(qn("w:hAnsi"), FONT_BODY)
+
+
+# ─────────────────────────────────────────────
 # FUNGSI UTAMA
 # ─────────────────────────────────────────────
 
@@ -76,41 +185,52 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
     """
     Konversi *_content_list.json MinerU ke python-docx Document.
 
-    Indentasi dihitung per-dokumen dari distribusi x0 aktual (percentile binning).
-    Cocok untuk dokumen scan yang x0-nya tidak presisi.
+    Secara otomatis mencari *_middle.json di folder yang sama untuk
+    menghitung margin halaman asli. Font default: Times New Roman 12pt.
     """
     with open(json_path, encoding="utf-8") as f:
         blocks = json.load(f)
 
     doc = Document()
+    _set_font_dokumen(doc)
 
-    # Margin standar dokumen pemerintah Indonesia
+    # ── Margin dari middle.json ──────────────
+    stem = json_path.stem.replace("_content_list", "")
+    middle_path = json_path.parent / f"{stem}_middle.json"
+    margin = _baca_margin_dari_middle(middle_path)
+
     for section in doc.sections:
-        section.top_margin = Cm(2.5)
-        section.bottom_margin = Cm(2.5)
-        section.left_margin = Cm(3)
-        section.right_margin = Cm(2.5)
+        section.left_margin   = margin["left"]
+        section.right_margin  = margin["right"]
+        section.top_margin    = margin["top"]
+        section.bottom_margin = margin["bottom"]
 
+    # ── Judul opsional ───────────────────────
     if judul:
         p = doc.add_heading(judul, level=0)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in p.runs:
+            _set_run_font(run)
 
     # ── Bangun mapper x0 → indent level ─────
-    # Gunakan semua blok teks untuk kalibrasi (termasuk heading — lebih representatif)
-    mapper, x0_min, x0_max = _bangun_x0_mapper(blocks, n_levels=4, batas_kanan=350)
-    CM_PER_LEVEL = 0.75   # indent Word per level
+    mapper, x0_min, x0_max = _bangun_x0_mapper(blocks, n_levels=6, batas_kanan=350)
+    CM_PER_LEVEL = 0.6   # indent Word per level (lebih rapat = lebih mirip PDF)
 
     halaman_sebelumnya = None
+    pertama_di_halaman = True   # untuk suppress spasi ganda setelah page break
 
     for block in blocks:
         tipe = block.get("type", "")
         page_idx = block.get("page_idx")
 
-        # Page break antar halaman
+        # ── Page break antar halaman ─────────
+        pindah_halaman = False
         if page_idx is not None and halaman_sebelumnya is not None:
             try:
                 if int(page_idx) != int(halaman_sebelumnya):
                     doc.add_page_break()
+                    pindah_halaman = True
+                    pertama_di_halaman = True
             except (ValueError, TypeError):
                 pass
         if page_idx is not None:
@@ -120,7 +240,7 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
         if tipe in ("header", "footer", "page_number"):
             continue
 
-        # ─── Blok teks
+        # ─── Blok teks ──────────────────────
         if tipe == "text":
             teks = block.get("text", "").strip()
             if not teks:
@@ -131,21 +251,32 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
             x0 = bbox[0] if bbox else x0_min
             lvl = mapper(x0)
 
+            # Space before: 0 jika blok pertama di halaman baru
+            sp_before = Pt(0) if pertama_di_halaman else Pt(2)
+            pertama_di_halaman = False
+
             if text_level == 1:
-                # Heading utama MinerU — selalu Word Heading 1
-                doc.add_heading(teks, level=1)
+                p = doc.add_heading(teks, level=1)
+                p.paragraph_format.space_before = sp_before
+                p.paragraph_format.space_after = Pt(2)
+                for run in p.runs:
+                    _set_run_font(run)
+                    run.font.bold = True
                 continue
 
             if text_level == 2:
-                # Heading sekunder — jadikan Heading 2 jika di level 0-1,
-                # paragraf indent jika lebih ke kanan (sub-item salah label)
                 if lvl <= 1:
-                    doc.add_heading(teks, level=2)
+                    p = doc.add_heading(teks, level=2)
+                    p.paragraph_format.space_before = sp_before
+                    p.paragraph_format.space_after = Pt(2)
+                    for run in p.runs:
+                        _set_run_font(run)
+                        run.font.bold = True
                 else:
                     p = doc.add_paragraph()
                     p.paragraph_format.left_indent = Cm(CM_PER_LEVEL * lvl)
-                    p.paragraph_format.space_before = Pt(1)
-                    p.paragraph_format.space_after = Pt(1)
+                    p.paragraph_format.space_before = sp_before
+                    p.paragraph_format.space_after = Pt(2)
                     _tambah_runs(p, teks)
                 continue
 
@@ -153,12 +284,13 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
             p = doc.add_paragraph()
             if lvl > 0:
                 p.paragraph_format.left_indent = Cm(CM_PER_LEVEL * lvl)
-            p.paragraph_format.space_before = Pt(1)
-            p.paragraph_format.space_after = Pt(1)
+            p.paragraph_format.space_before = sp_before
+            p.paragraph_format.space_after = Pt(2)
             _tambah_runs(p, teks)
 
-        # ─── Blok tabel
+        # ─── Blok tabel ─────────────────────
         elif tipe == "table":
+            pertama_di_halaman = False
             table_body = block.get("table_body", "")
             caption = block.get("table_caption", "")
             if table_body:
@@ -168,15 +300,16 @@ def content_list_ke_docx(json_path: Path, judul: str = "") -> Document:
                     teks_bersih = re.sub(r"<[^>]+>", " ", table_body)
                     teks_bersih = re.sub(r"\s+", " ", teks_bersih).strip()
                     if teks_bersih:
-                        doc.add_paragraph(teks_bersih)
+                        p = doc.add_paragraph(teks_bersih)
             if caption and str(caption) not in ("[]", "", "['']"):
                 caption_str = str(caption).strip("[]'\"").strip()
                 if caption_str:
                     doc.add_paragraph(caption_str)
             doc.add_paragraph()
 
-        # ─── Blok gambar / stempel
+        # ─── Blok gambar / stempel ──────────
         elif tipe in ("image", "seal"):
+            pertama_di_halaman = False
             img_path_rel = block.get("img_path", "")
             if img_path_rel:
                 img_abs = json_path.parent / img_path_rel
@@ -201,7 +334,7 @@ def content_list_ke_bytes(json_path: Path, judul: str = "") -> bytes:
     return buf.getvalue()
 
 
-def cari_content_list_json(output_dir: Path, stem: str) -> "Path | None":
+def cari_content_list_json(output_dir: Path, stem: str) -> Optional[Path]:
     """Cari *_content_list.json di folder output MinerU."""
     kandidat = [
         output_dir / stem / "auto" / f"{stem}_content_list.json",
@@ -274,9 +407,15 @@ def _tambah_tabel_html(doc: Document, html: str):
             word_cell = table.cell(r_idx, c_grid)
             word_cell.text = cell_data["text"][:500]
 
+            # Font dalam sel tabel
+            for para in word_cell.paragraphs:
+                for run in para.runs:
+                    _set_run_font(run)
+
             if cell_data["header"] or r_idx == 0:
-                for run in word_cell.paragraphs[0].runs:
-                    run.bold = True
+                for para in word_cell.paragraphs:
+                    for run in para.runs:
+                        run.bold = True
 
             if colspan > 1 or rowspan > 1:
                 end_row = min(r_idx + rowspan - 1, total_rows - 1)
@@ -298,18 +437,21 @@ def _tambah_tabel_html(doc: Document, html: str):
 # ─────────────────────────────────────────────
 
 def _tambah_runs(paragraph, teks: str):
-    """Parse **bold**, *italic*, `code` dan tambahkan ke paragraph."""
+    """Parse **bold**, *italic*, `code` dan tambahkan ke paragraph dengan font TNR."""
     pattern = re.compile(r"(\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|([^*`]+))")
     for m in pattern.finditer(teks):
         if m.group(2):
             run = paragraph.add_run(m.group(2))
+            _set_run_font(run)
             run.bold = True
         elif m.group(3):
             run = paragraph.add_run(m.group(3))
+            _set_run_font(run)
             run.italic = True
         elif m.group(4):
             run = paragraph.add_run(m.group(4))
             run.font.name = "Courier New"
-            run.font.size = Pt(9)
+            run.font.size = Pt(10)
         elif m.group(5):
-            paragraph.add_run(m.group(5))
+            run = paragraph.add_run(m.group(5))
+            _set_run_font(run)
