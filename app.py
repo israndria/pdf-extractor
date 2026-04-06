@@ -24,6 +24,7 @@ from engine.ekstraksi import ekstrak_pdf, simpan_uploaded_pdf
 from engine.parser_field import parse_field_pengadaan, export_ke_lpse_json, hitung_kelengkapan
 from engine.supabase_uploader import simpan_ke_supabase, cek_koneksi_supabase
 from engine.md_ke_docx import md_ke_bytes
+from engine.content_list_ke_docx import content_list_ke_bytes
 
 # ─────────────────────────────────────────────
 # KONFIGURASI HALAMAN
@@ -226,9 +227,19 @@ with tab1:
                         )
                     with col_dl2:
                         try:
-                            docx_bytes = md_ke_bytes(teks, judul=Path(nama_file).stem)
+                            # Gunakan content_list.json jika tersedia (lebih akurat)
+                            cl_path = hasil.get("content_list_path")
+                            if cl_path and Path(cl_path).exists():
+                                docx_bytes = content_list_ke_bytes(
+                                    Path(cl_path),
+                                    judul=Path(nama_file).stem,
+                                )
+                                label_docx = "⬇️ Download DOCX (Akurat)"
+                            else:
+                                docx_bytes = md_ke_bytes(teks, judul=Path(nama_file).stem)
+                                label_docx = "⬇️ Download DOCX"
                             st.download_button(
-                                label="⬇️ Download DOCX",
+                                label=label_docx,
                                 data=docx_bytes,
                                 file_name=f"{Path(nama_file).stem}.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

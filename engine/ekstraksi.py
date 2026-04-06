@@ -74,6 +74,7 @@ def ekstrak_pdf(
             success (bool)
             markdown_path (Path|None) — path ke file .md hasil
             markdown_text (str) — isi teks Markdown
+            content_list_path (Path|None) — path ke *_content_list.json (untuk DOCX akurat)
             tipe_pdf (str) — 'native'|'scan'|'mixed'
             error (str|None)
     """
@@ -88,6 +89,7 @@ def ekstrak_pdf(
             "success": False,
             "markdown_path": None,
             "markdown_text": "",
+            "content_list_path": None,
             "tipe_pdf": tipe_pdf,
             "error": f"mineru tidak ditemukan di {MINERU_EXE}",
         }
@@ -118,6 +120,7 @@ def ekstrak_pdf(
                 "success": False,
                 "markdown_path": None,
                 "markdown_text": "",
+                "content_list_path": None,
                 "tipe_pdf": tipe_pdf,
                 "error": result.stderr[-1000:],
             }
@@ -126,6 +129,7 @@ def ekstrak_pdf(
             "success": False,
             "markdown_path": None,
             "markdown_text": "",
+            "content_list_path": None,
             "tipe_pdf": tipe_pdf,
             "error": "Timeout: proses ekstraksi melebihi 10 menit",
         }
@@ -134,21 +138,26 @@ def ekstrak_pdf(
             "success": False,
             "markdown_path": None,
             "markdown_text": "",
+            "content_list_path": None,
             "tipe_pdf": tipe_pdf,
             "error": str(e),
         }
 
     # Cari file .md yang dihasilkan
-    # MinerU output structure: output_dir/<stem>/pipeline/<stem>.md
+    # MinerU output structure: output_dir/<stem>/auto/<stem>.md
     md_path = _cari_file_md(output_dir, pdf_path.stem)
+    content_list_path = _cari_content_list(output_dir, pdf_path.stem)
+
     if md_path and md_path.exists():
         teks = md_path.read_text(encoding="utf-8", errors="replace")
         if on_progress:
-            on_progress(f"Ekstraksi selesai. {len(teks):,} karakter diekstrak.")
+            cl_info = " + content_list.json ✓" if content_list_path else ""
+            on_progress(f"Ekstraksi selesai. {len(teks):,} karakter diekstrak.{cl_info}")
         return {
             "success": True,
             "markdown_path": md_path,
             "markdown_text": teks,
+            "content_list_path": content_list_path,
             "tipe_pdf": tipe_pdf,
             "error": None,
         }
@@ -162,6 +171,7 @@ def ekstrak_pdf(
                 "success": True,
                 "markdown_path": md_path,
                 "markdown_text": teks,
+                "content_list_path": content_list_path,
                 "tipe_pdf": tipe_pdf,
                 "error": None,
             }
@@ -169,6 +179,7 @@ def ekstrak_pdf(
             "success": False,
             "markdown_path": None,
             "markdown_text": "",
+            "content_list_path": None,
             "tipe_pdf": tipe_pdf,
             "error": "File Markdown output tidak ditemukan. Cek log mineru di atas.",
         }
@@ -199,6 +210,16 @@ def _cari_file_md(output_dir: Path, stem: str) -> Optional[Path]:
     for p in kandidat:
         if p.exists():
             return p
+    return None
+
+
+def _cari_content_list(output_dir: Path, stem: str) -> Optional[Path]:
+    """Cari file *_content_list.json di folder output MinerU."""
+    subfolder = output_dir / stem
+    if subfolder.exists():
+        hasil = list(subfolder.rglob("*_content_list.json"))
+        if hasil:
+            return hasil[0]
     return None
 
 
